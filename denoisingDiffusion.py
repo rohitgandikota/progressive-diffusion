@@ -1,6 +1,14 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jun 28 10:03:26 2022
+
+@author: Rohit Gandikota
+"""
 import math
 import copy
 import torch
+import glob
 from torch import nn, einsum
 import torch.nn.functional as F
 from inspect import isfunction
@@ -18,6 +26,22 @@ from tqdm import tqdm
 from einops import rearrange
 from einops.layers.torch import Rearrange
 
+import numpy
+from numpy import cov
+from numpy import trace
+from numpy import iscomplexobj
+from numpy import asarray
+from numpy.random import randint
+from scipy.linalg import sqrtm
+from keras.applications.inception_v3 import InceptionV3
+from keras.applications.inception_v3 import preprocess_input
+from keras.datasets.mnist import load_data
+from skimage.transform import resize
+import matplotlib.pyplot as plt
+torch.cuda.empty_cache()
+
+
+import tensorflow as tf
 # helpers functions
 
 def exists(x):
@@ -46,6 +70,35 @@ def normalize_to_neg_one_to_one(img):
 
 def unnormalize_to_zero_to_one(t):
     return (t + 1) * 0.5
+
+# scale an array of images to a new size
+def scale_images(images, new_shape):
+	images_list = list()
+	for image in images:
+		# resize with nearest neighbor interpolation
+		new_image = resize(image, new_shape, 0)
+		# store
+		images_list.append(new_image)
+	return asarray(images_list)
+ 
+# calculate frechet inception distance
+def calculate_fid(model, images1, images2):
+	# calculate activations
+	act1 = model.predict(images1)
+	act2 = model.predict(images2)
+	# calculate mean and covariance statistics
+	mu1, sigma1 = act1.mean(axis=0), cov(act1, rowvar=False)
+	mu2, sigma2 = act2.mean(axis=0), cov(act2, rowvar=False)
+	# calculate sum squared difference between means
+	ssdiff = numpy.sum((mu1 - mu2)**2.0)
+	# calculate sqrt of product between cov
+	covmean = sqrtm(sigma1.dot(sigma2))
+	# check and correct imaginary numbers from sqrt
+	if iscomplexobj(covmean):
+		covmean = covmean.real
+	# calculate score
+	fid = ssdiff + trace(sigma1 + sigma2 - 2.0 * covmean)
+	return fid
 
 # small helper modules
 
@@ -224,7 +277,7 @@ def MLP(dim_in, dim_hidden):
         nn.Linear(dim_hidden, dim_hidden)
     )
 
-class Unet(nn.Module):
+class finalModel(nn.Module):
     def __init__(
         self,
         dim,
@@ -365,6 +418,7 @@ class GaussianDiffusion(nn.Module):
         channels = 3,
         timesteps = 1000,
         loss_type = 'l1',
+        num_layer = 0,
         objective = 'pred_noise',
         beta_schedule = 'cosine'
     ):
@@ -372,7 +426,7 @@ class GaussianDiffusion(nn.Module):
         assert not (type(self) == GaussianDiffusion and denoise_fn.channels != denoise_fn.out_dim)
 
         self.channels = channels
-        self.image_size = image_size
+        self.image_size = 2**(num_layer+2)
         self.denoise_fn = denoise_fn
         self.objective = objective
 
@@ -541,7 +595,7 @@ class GaussianDiffusion(nn.Module):
 # dataset classes
 
 class Dataset(data.Dataset):
-    def __init__(self, folder, image_size, exts = ['jpg', 'jpeg', 'png']):
+    def __init__(self, folder, image_size, exts = ['jpg', 'jpeg', 'png','JPEG']):
         super().__init__()
         self.folder = folder
         self.image_size = image_size
@@ -562,16 +616,210 @@ class Dataset(data.Dataset):
         img = Image.open(path)
         return self.transform(img)
 
+
+
+# Progressive Adding to model
+class addLayer(nn.Module):
+    def __init__(
+        self,
+        model,
+        num_layer = 1,
+        alpha = 0.0,
+        init_dim = None,
+        out_dim = None,
+        dim_mults=(1, 2, 4, 8),
+        channels = 3,
+        resnet_block_groups = 8,
+        learned_variance = False,
+        sinusoidal_cond_mlp = True
+     ):
+        super().__init__()
+        self.model = model
+        self.alpha = alpha
+        
+        self.num_layer = num_layer
+        # determine dimensions
+        self.channels = channels
+
+        self.init_conv = nn.Conv2d(self.model.channels, self.model.down_inits[-(self.num_layer-1)], 7, padding = 3)
+
+
+        block_klass = partial(ResnetBlock, groups = resnet_block_groups)
+
+        # time embeddings
+
+
+        self.sinusoidal_cond_mlp = sinusoidal_cond_mlp
+
+        # layers
+
+        self.downs = nn.ModuleList([])
+        self.down_inits = []
+        self.up_inits = []
+        self.ups = nn.ModuleList([])
+
+        default_out_dim = channels * (1 if not learned_variance else 2)
+        self.out_dim = default(out_dim, default_out_dim)
+
+        self.final_conv = nn.Sequential(
+            block_klass(1024, 1024),
+            nn.Conv2d(1024, self.out_dim, 1)
+        )
+        
+    def forward(self,x,time):
+        inp = self.init_conv(x)
+        t = self.model.time_mlp(time)
+        x = inp
+        h = []
+        layers_added = 0
+        for block1, block2, attn, downsample in self.model.downs[-self.num_layer:]:
+            x = block1(x, t)
+            x = block2(x, t)
+            x = attn(x)
+            h.append(x)
+            x = downsample(x)
+            layers_added+=1
+            if layers_added > 0:
+                if layers_added == 1:
+                    res = downsample(inp)
+                res = block1(res, t)
+                res = block2(res, t)
+                res = attn(res)
+                res = downsample(res)
+        x = (self.alpha)*x+(1-self.alpha)*res
+        
+        x = self.model.mid_block1(x, t)
+        x = self.model.mid_attn(x)
+        x = self.model.mid_block2(x, t)
+        layers_added = 0
+        for block1, block2, attn, upsample in self.model.ups[:self.num_layer-1]:
+            if layers_added == self.num_layer+1:
+                res = upsample(x)
+                res = torch.cat((res, h.pop()), dim=1)
+            x = torch.cat((x, h.pop()), dim=1)
+            x = block1(x, t)
+            x = block2(x, t)
+            x = attn(x)
+            x = upsample(x)
+            layers_added+=1
+        print(x.size())
+        print(res.size())
+        x = (self.alpha)*x+(1-self.alpha)*res
+        if self.num_layer == len(self.model.downs):
+            out = self.model.final_conv(x)
+        else:
+            out = self.model.final_conv(x)
+
+        return out
+        
+        
+class initProgression(nn.Module):
+    def __init__(
+        self,
+        dim,
+        init_dim = None,
+        out_dim = None,
+        dim_mults=(1, 2, 4, 8),
+        channels = 3,
+        resnet_block_groups = 8,
+        learned_variance = False,
+        sinusoidal_cond_mlp = True
+    ):
+        super().__init__()
+
+        # determine dimensions
+        self.channels = channels
+
+        init_dim = default(init_dim, dim // 3 * 2)
+        self.init_conv = nn.Conv2d(channels, 1024, 7, padding = 3)
+
+        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+
+        block_klass = partial(ResnetBlock, groups = resnet_block_groups)
+
+        # time embeddings
+
+        time_dim = dim * 4
+
+        self.sinusoidal_cond_mlp = sinusoidal_cond_mlp
+
+        if sinusoidal_cond_mlp:
+            self.time_mlp = nn.Sequential(
+                SinusoidalPosEmb(dim),
+                nn.Linear(dim, time_dim),
+                nn.GELU(),
+                nn.Linear(time_dim, time_dim)
+            )
+        else:
+            self.time_mlp = MLP(1, time_dim)
+
+        # layers
+
+        self.downs = nn.ModuleList([])
+        self.down_inits = []
+        self.up_inits = []
+        self.ups = nn.ModuleList([])
+        num_resolutions = len(in_out)
+
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (num_resolutions - 1)
+            self.down_inits.append(dim_in)
+            self.downs.append(nn.ModuleList([
+                block_klass(dim_in, dim_out, time_emb_dim = time_dim),
+                block_klass(dim_out, dim_out, time_emb_dim = time_dim),
+                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                Downsample(dim_out) if not is_last else nn.Identity()
+            ]))
+
+        mid_dim = dims[-1]
+        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
+        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (num_resolutions - 1)
+            self.up_inits.append(dim_out)
+            self.ups.append(nn.ModuleList([
+                block_klass(dim_out * 2, dim_in, time_emb_dim = time_dim),
+                block_klass(dim_in, dim_in, time_emb_dim = time_dim),
+                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                Upsample(dim_in) if not is_last else nn.Identity()
+            ]))
+
+        default_out_dim = channels * (1 if not learned_variance else 2)
+        self.out_dim = default(out_dim, default_out_dim)
+
+        self.final_conv = nn.Sequential(
+            block_klass(1024, 1024),
+            nn.Conv2d(1024, self.out_dim, 1)
+        )
+        
+
+
+    def forward(self, x, time):
+        x = self.init_conv(x)
+        t = self.time_mlp(time)
+
+        x = self.mid_block1(x, t)
+        x = self.mid_attn(x)
+        x = self.mid_block2(x, t)
+         
+
+        return self.final_conv(x)
+
+
+
 # trainer class
 
 class Trainer(object):
     def __init__(
         self,
-        diffusion_model,
+        progressiveModel,
         folder,
         *,
         ema_decay = 0.995,
-        image_size = 128,
+        image_size = 256,
         train_batch_size = 32,
         train_lr = 1e-4,
         train_num_steps = 100000,
@@ -583,8 +831,18 @@ class Trainer(object):
         results_folder = './results'
     ):
         super().__init__()
+        self.progressiveModel = progressiveModel
+        diffusion_model = GaussianDiffusion(
+            self.progressiveModel,
+            image_size = 128,
+            timesteps = 1000,   # number of steps
+            loss_type = 'l1',    # L1 or L2
+            num_layer = 0
+        ).cuda()
+        
         self.model = diffusion_model
         self.ema = EMA(ema_decay)
+        self.ema_decay = ema_decay
         self.ema_model = copy.deepcopy(self.model)
         self.update_ema_every = update_ema_every
 
@@ -593,21 +851,26 @@ class Trainer(object):
 
         self.batch_size = train_batch_size
         self.image_size = diffusion_model.image_size
+        self.train_batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
         self.train_num_steps = train_num_steps
-
-        self.ds = Dataset(folder, image_size)
+        
+        self.folder = folder
+        self.ds = Dataset(folder, 2**(0+2))
+        
         self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=True, pin_memory=True))
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
-
+        #with tf.device('/cpu:0'):
+        
         self.step = 0
-
+        
         self.amp = amp
         self.scaler = GradScaler(enabled = amp)
 
         self.results_folder = Path(results_folder)
         self.results_folder.mkdir(exist_ok = True)
-
+        
+        self.folder = results_folder
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -639,17 +902,52 @@ class Trainer(object):
 
     def train(self):
         with tqdm(initial = self.step, total = self.train_num_steps) as pbar:
-
+            loss_degrade = 0
+            loss_prev = 0
+            fade_level = 0
+            T =100
+            s = 0.7
+            num_layer = 0
+            stage_steps = 0 # counter for num of steps per resolution
             while self.step < self.train_num_steps:
+                
                 for i in range(self.gradient_accumulate_every):
-                    data = next(self.dl).cuda()
-
+                    data_ = next(self.dl).cuda()
+                    stage_steps+=1
                     with autocast(enabled = self.amp):
-                        loss = self.model(data)
+                        loss = self.model(data_)
+                        # Check for loss degradation
+                        if loss_prev == loss:
+                            loss_degrade+=1
+                        # reset
+                        else:
+                            loss_degrade = 0
+                        loss_prev = loss
                         self.scaler.scale(loss / self.gradient_accumulate_every).backward()
 
                     pbar.set_description(f'loss: {loss.item():.4f}')
-
+                    if loss_degrade > 15 or stage_steps>1 or fade_level>0:
+                        
+                        num_layer+=1     
+                        lambd = numpy.sin((((fade_level/T)+s)/(1+s))*(numpy.pi/2))
+                        self.progressiveModel = addLayer(self.progressiveModel,num_layer = num_layer, alpha = lambd)
+                        diffusion_model = GaussianDiffusion(
+                            self.progressiveModel,
+                            image_size = 4*(num_layer+1),
+                            timesteps = 1000,   # number of steps
+                            loss_type = 'l1',    # L1 or L2
+                            num_layer = num_layer
+                        ).cuda()
+                        print('success')
+                        self.model = diffusion_model
+                        self.ema = EMA(self.ema_decay)
+                        self.ema_model = copy.deepcopy(self.model)
+                        if fade_level==0:
+                            self.ds = Dataset(self.folder, 2**(num_layer+2))
+                            self.dl = cycle(data.DataLoader(self.ds, batch_size = self.train_batch_size, shuffle=True, pin_memory=True))
+                        fade_level+=1
+                    if fade_level == T:
+                        fade_level=0
                 self.scaler.step(self.opt)
                 self.scaler.update()
                 self.opt.zero_grad()
@@ -666,8 +964,15 @@ class Trainer(object):
                     all_images = torch.cat(all_images_list, dim=0)
                     utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = 6)
                     self.save(milestone)
-
+                    
+                    
+                    
                 self.step += 1
                 pbar.update(1)
-
+        
+        
+        
         print('training complete')
+        
+
+ 

@@ -926,7 +926,7 @@ class Trainer(object):
         self.scaler.load_state_dict(data['scaler'])
 
     def train(self):
-        with tqdm(initial = self.step, total = self.train_num_steps, position=0, leave=True) as pbar:
+        with tqdm(initial = self.step, total = self.train_num_steps) as pbar:
             stop_grow = False
             if numpy.log2(self.im_size)<len(self.progressiveModel.dims) :
                 raise Exception('The input dimensions are not supported!')

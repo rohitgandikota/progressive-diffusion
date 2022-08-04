@@ -525,7 +525,7 @@ class GaussianDiffusion(nn.Module):
         b = shape[0]
         img = torch.randn(shape, device=device)
 
-        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps, position=0, leave=True):
             img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
 
         img = unnormalize_to_zero_to_one(img)
@@ -548,7 +548,7 @@ class GaussianDiffusion(nn.Module):
         xt1, xt2 = map(lambda x: self.q_sample(x, t=t_batched), (x1, x2))
 
         img = (1 - lam) * xt1 + lam * xt2
-        for i in tqdm(reversed(range(0, t)), desc='interpolation sample time step', total=t):
+        for i in tqdm(reversed(range(0, t)), desc='interpolation sample time step', total=t, position=0, leave=True):
             img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long))
 
         return img
@@ -649,7 +649,7 @@ class addLayer(nn.Module):
         self.channels = channels
         self.dims = dims
         self.init_dim = model.init_dim
-        print(f'Init_Conv: {-(self.num_layer+1)}')
+        # print(f'Init_Conv: {-(self.num_layer+1)}')
         if self.num_layer==len(model.dims):
             self.init_conv = nn.Conv2d(self.model.channels, self.init_dim, 7, padding = 3)
         else:
@@ -681,10 +681,10 @@ class addLayer(nn.Module):
         x = inp
         h = []
         layers_added = 0
-        print(f'Number of Layers: {self.num_layer}')
+        # print(f'Number of Layers: {self.num_layer}')
         for block1, block2, attn, downsample,down_res in self.model.downs[-self.num_layer:]:
-            if self.num_layer == len(self.dims)-1:
-                print(f'Last Layer : {x.size()}')
+            # if self.num_layer == len(self.dims)-1:
+                # print(f'Last Layer : {x.size()}')
             x = block1(x, t)
             x = block2(x, t)
             x = attn(x)
@@ -699,8 +699,8 @@ class addLayer(nn.Module):
                 res = attn(res)
                 if self.num_layer != layers_added+1:
                     res = downsample(res)
-        print(f'Res_down: {res.size()}')
-        print(f'X_down : {x.size()}')
+        # print(f'Res_down: {res.size()}')
+        # print(f'X_down : {x.size()}')
         x = (self.alpha)*x+(1-self.alpha)*res
         
         x = self.model.mid_block1(x, t)
@@ -719,8 +719,8 @@ class addLayer(nn.Module):
            
         
         if self.num_layer>1:
-            print(f'Res_up: {res2.size()}')
-            print(f'X_up : {x.size()}')
+            # print(f'Res_up: {res2.size()}')
+            # print(f'X_up : {x.size()}')
             x = (self.alpha)*x+(1-self.alpha)*res2
         
         out = self.final_conv(x)
@@ -926,7 +926,7 @@ class Trainer(object):
         self.scaler.load_state_dict(data['scaler'])
 
     def train(self):
-        with tqdm(initial = self.step, total = self.train_num_steps) as pbar:
+        with tqdm(initial = self.step, total = self.train_num_steps, position=0, leave=True) as pbar:
             stop_grow = False
             if numpy.log2(self.im_size)<len(self.progressiveModel.dims) :
                 raise Exception('The input dimensions are not supported!')
@@ -950,7 +950,7 @@ class Trainer(object):
                         self.scaler.scale(loss / self.gradient_accumulate_every).backward()
 
                     pbar.set_description(f'loss: {loss.item():.4f}')
-                if loss_prev == loss.item():
+                if not loss_prev > loss.item():
                     loss_degrade+=1
                 # reset
                 else:
@@ -999,7 +999,6 @@ class Trainer(object):
                         loss_type = self.loss_type,    # L1 or L2
                         num_layer = num_layer
                     ).cuda(1)
-                    print('success')
                     self.model = diffusion_model
                     self.ema = EMA(self.ema_decay)
                     self.ema_model = copy.deepcopy(self.model)
